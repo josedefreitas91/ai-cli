@@ -90,7 +90,7 @@ bootstrap_and_reexec() {
   local repo="$1"
   local ref="$2"
   shift 2
-  local passthrough=("$@")
+  local -a passthrough=("$@")
   local archive_ref archive_url tmp_dir src_dir
 
   if [[ "$ref" == "latest" ]]; then
@@ -113,7 +113,11 @@ bootstrap_and_reexec() {
   fi
 
   chmod +x "$src_dir/install.sh"
-  exec "$src_dir/install.sh" --repo "$repo" --ref "$archive_ref" "${passthrough[@]}"
+  if [[ "${#passthrough[@]}" -gt 0 ]]; then
+    exec "$src_dir/install.sh" --repo "$repo" --ref "$archive_ref" "${passthrough[@]}"
+  else
+    exec "$src_dir/install.sh" --repo "$repo" --ref "$archive_ref"
+  fi
 }
 
 # Parse bootstrap options first and keep install args for later.
