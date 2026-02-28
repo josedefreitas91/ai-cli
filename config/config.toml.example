@@ -1,0 +1,32 @@
+# Copy this file to ~/.config/ai-cli/config.toml
+# mkdir -p ~/.config/ai-cli
+# cp ./config/config.toml.example ~/.config/ai-cli/config.toml
+
+provider = "codex"
+model = ""
+provider_cmd = ""
+shell = "zsh"
+timeout_seconds = "30"
+max_retries = "1"
+prompt_mode = "strict"
+ui = "compact"
+show_meta = "0"
+
+[profiles.fast]
+model = "gpt-5.3-codex-spark"
+timeout_seconds = "20"
+max_retries = "2"
+prompt_mode = "creative"
+ui = "pretty"
+show_meta = "1"
+
+[profiles.quality]
+model = "gpt-5.3-codex"
+timeout_seconds = "60"
+max_retries = "2"
+
+[profiles.opencode]
+provider = "opencode"
+model = ""
+timeout_seconds = "30"
+max_retries = "1"

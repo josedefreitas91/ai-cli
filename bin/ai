@@ -1,0 +1,691 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
+set -euo pipefail
+
+VERSION="0.0.1"
+CONFIG_DIR_DEFAULT="$HOME/.config/ai-cli"
+DEFAULT_CONFIG="$CONFIG_DIR_DEFAULT/config.toml"
+HISTORY_DIR_DEFAULT="$CONFIG_DIR_DEFAULT/history"
+AUTO_COPY_DEFAULT=1
+C_RESET=""
+C_RED=""
+C_YELLOW=""
+C_CYAN=""
+C_GREEN=""
+C_MAGENTA=""
+C_BOLD=""
+
+
+die() {
+  printf '%sError:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf '%sWarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+strip_fences_and_noise() {
+  local input="$1"
+
+  input="$(printf '%s\n' "$input" | sed '/^```/d')"
+
+  local line
+  while IFS= read -r line; do
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      "Here is"*|"Sure"*|"You can"*)
+        continue
+        ;;
+    esac
+    printf '%s\n' "$line"
+    return 0
+  done <<< "$input"
+
+  printf '%s\n' "$(trim "$input")"
+}
+
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+detect_os() {
+  if [[ -n "${AI_CLI_OS:-}" ]]; then
+    printf '%s' "$AI_CLI_OS"
+    return 0
+  fi
+  uname -s
+}
+
+is_utf8_locale() {
+  local locale_value
+  locale_value="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  [[ "$locale_value" == *"UTF-8"* || "$locale_value" == *"utf8"* ]]
+}
+
+use_color_output() {
+  [[ "${NO_COLOR_MODE:-0}" == "1" ]] && return 1
+  [[ -n "${NO_COLOR:-}" ]] && return 1
+  [[ -t 2 ]] || return 1
+  [[ "${TERM:-}" == "dumb" ]] && return 1
+  return 0
+}
+
+init_output_style() {
+  if use_color_output; then
+    C_RESET=$'\033[0m'
+    C_RED=$'\033[31m'
+    C_YELLOW=$'\033[33m'
+    C_CYAN=$'\033[36m'
+    C_GREEN=$'\033[32m'
+    C_MAGENTA=$'\033[35m'
+    C_BOLD=$'\033[1m'
+  else
+    C_RESET=""
+    C_RED=""
+    C_YELLOW=""
+    C_CYAN=""
+    C_GREEN=""
+    C_MAGENTA=""
+    C_BOLD=""
+  fi
+}
+
+should_show_spinner() {
+  [[ "${SPINNER_ENABLED:-1}" == "1" ]] || return 1
+  [[ -t 1 ]] || return 1
+  [[ "${AI_CLI_NO_SPINNER:-0}" == "1" ]] && return 1
+  return 0
+}
+
+run_loading_spinner() {
+  local pid="$1"
+  local prefix="${C_CYAN}AI thinking${C_RESET}"
+  local frames=()
+  local i=0
+
+  if is_utf8_locale; then
+    frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  else
+    frames=("" "." ".." "...")
+  fi
+
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    printf '\r%s %s' "$prefix" "${frames[$i]}"
+    i=$(( (i + 1) % ${#frames[@]} ))
+    sleep 0.2
+  done
+  printf '\r\033[K'
+}
+
+copy_to_clipboard() {
+  local text="$1"
+  local os_name
+  os_name="$(detect_os)"
+
+  case "$os_name" in
+    Darwin)
+      has_cmd pbcopy || return 1
+      printf '%s' "$text" | pbcopy
+      return $?
+      ;;
+    Linux)
+      if has_cmd wl-copy; then
+        printf '%s' "$text" | wl-copy
+        return $?
+      fi
+      if has_cmd xclip; then
+        printf '%s' "$text" | xclip -selection clipboard
+        return $?
+      fi
+      if has_cmd xsel; then
+        printf '%s' "$text" | xsel --clipboard --input
+        return $?
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_positive_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+toml_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+prompt_default() {
+  local question="$1"
+  local default="$2"
+  local answer
+  read -r -p "$question [$default]: " answer
+  printf '%s' "${answer:-$default}"
+}
+
+
+resolve_script_path() {
+  local source_path="$1"
+  local dir link_target
+
+  while [[ -L "$source_path" ]]; do
+    dir="$(cd "$(dirname "$source_path")" && pwd)"
+    link_target="$(readlink "$source_path")"
+    if [[ "$link_target" == /* ]]; then
+      source_path="$link_target"
+    else
+      source_path="$dir/$link_target"
+    fi
+  done
+
+  printf '%s\n' "$source_path"
+}
+
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+APP_HOME_DEFAULT="$(cd "$SCRIPT_DIR/.." && pwd)"
+APP_HOME="${AI_CLI_HOME:-$APP_HOME_DEFAULT}"
+LIB_DIR="$APP_HOME/lib"
+
+if [[ ! -d "$LIB_DIR" ]]; then
+  die "ai runtime library directory not found: $LIB_DIR"
+fi
+
+# shellcheck source=/dev/null
+source "$LIB_DIR/ui.sh"
+# shellcheck source=/dev/null
+source "$LIB_DIR/history.sh"
+# shellcheck source=/dev/null
+source "$LIB_DIR/config.sh"
+# shellcheck source=/dev/null
+source "$LIB_DIR/providers.sh"
+# shellcheck source=/dev/null
+source "$LIB_DIR/commands.sh"
+
+CONFIG_PATH="$DEFAULT_CONFIG"
+PROFILE_NAME=""
+PROVIDER_ARG=""
+MODEL_ARG=""
+MODEL_ARG_SET=0
+TARGET_SHELL_ARG=""
+TIMEOUT_ARG=""
+MAX_RETRIES_ARG=""
+HISTORY_DAYS_ARG=""
+HISTORY_SEARCH_ARG=""
+PROMPT_MODE_ARG=""
+UI_MODE_ARG=""
+SHOW_META_ARG=""
+UPDATE_REF_ARG=""
+UPDATE_SCOPE_ARG=""
+
+RUN_COMMAND=0
+DRY_RUN_MODE=0
+CONFIRM_RUN=0
+EXPLAIN_MODE=0
+SHOW_HISTORY=0
+SHOW_FULL=0
+RAW_OUTPUT=0
+COPY_MODE=0
+AUTO_COPY_MODE="$AUTO_COPY_DEFAULT"
+NO_COLOR_MODE=0
+QUIET_MODE=0
+JSON_MODE=0
+DOCTOR_MODE=0
+PROFILE_EDITOR_MODE=0
+SHOW_VERSION=0
+FORCE_MODE=0
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--provider)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      PROVIDER_ARG="$2"
+      shift 2
+      ;;
+    -m|--model)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      MODEL_ARG="$2"
+      MODEL_ARG_SET=1
+      shift 2
+      ;;
+    -c|--config)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      CONFIG_PATH="$2"
+      shift 2
+      ;;
+    --profile)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      PROFILE_NAME="$2"
+      shift 2
+      ;;
+    --prompt-mode)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      PROMPT_MODE_ARG="$2"
+      shift 2
+      ;;
+    --ui)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      UI_MODE_ARG="$2"
+      shift 2
+      ;;
+    --meta)
+      SHOW_META_ARG="1"
+      shift
+      ;;
+    --no-meta)
+      SHOW_META_ARG="0"
+      shift
+      ;;
+    --shell)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      TARGET_SHELL_ARG="$2"
+      shift 2
+      ;;
+    --timeout)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      TIMEOUT_ARG="$2"
+      shift 2
+      ;;
+    --max-retries)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      MAX_RETRIES_ARG="$2"
+      shift 2
+      ;;
+    --run)
+      RUN_COMMAND=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN_MODE=1
+      shift
+      ;;
+    --confirm)
+      CONFIRM_RUN=1
+      shift
+      ;;
+    --explain)
+      EXPLAIN_MODE=1
+      shift
+      ;;
+    --copy)
+      COPY_MODE=1
+      shift
+      ;;
+    --no-auto-copy)
+      AUTO_COPY_MODE=0
+      shift
+      ;;
+    --no-color)
+      NO_COLOR_MODE=1
+      shift
+      ;;
+    --quiet)
+      QUIET_MODE=1
+      shift
+      ;;
+    --json)
+      JSON_MODE=1
+      shift
+      ;;
+    --history)
+      SHOW_HISTORY=1
+      shift
+      ;;
+    --full)
+      SHOW_FULL=1
+      shift
+      ;;
+    --ref)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      UPDATE_REF_ARG="$2"
+      shift 2
+      ;;
+    --scope)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      UPDATE_SCOPE_ARG="$2"
+      shift 2
+      ;;
+    --days)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      HISTORY_DAYS_ARG="$2"
+      shift 2
+      ;;
+    --search)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      HISTORY_SEARCH_ARG="$2"
+      shift 2
+      ;;
+    --raw)
+      RAW_OUTPUT=1
+      shift
+      ;;
+    --force)
+      FORCE_MODE=1
+      shift
+      ;;
+    --version)
+      SHOW_VERSION=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        POSITIONAL+=("$1")
+        shift
+      done
+      ;;
+    -* )
+      die "Unknown option: $1"
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "$RUN_COMMAND" -eq 1 && "$DRY_RUN_MODE" -eq 1 ]]; then
+  die "Options --run and --dry-run cannot be used together."
+fi
+
+if [[ "$RUN_COMMAND" -eq 1 && "$RAW_OUTPUT" -eq 1 ]]; then
+  die "Options --run and --raw cannot be used together."
+fi
+
+if [[ "$RAW_OUTPUT" -eq 1 && "$EXPLAIN_MODE" -eq 1 ]]; then
+  die "Options --raw and --explain cannot be used together."
+fi
+
+if [[ "$JSON_MODE" -eq 1 && "$RAW_OUTPUT" -eq 1 ]]; then
+  die "Options --json and --raw cannot be used together."
+fi
+
+if [[ "$JSON_MODE" -eq 1 && "$RUN_COMMAND" -eq 1 ]]; then
+  die "Options --json and --run cannot be used together."
+fi
+
+if [[ "$COPY_MODE" -eq 1 && "$RUN_COMMAND" -eq 1 ]]; then
+  die "Options --copy and --run cannot be used together."
+fi
+
+if [[ "$QUIET_MODE" -eq 1 && "$EXPLAIN_MODE" -eq 1 ]]; then
+  die "Options --quiet and --explain cannot be used together."
+fi
+
+init_output_style
+
+UI_MODE="${UI_MODE_ARG:-compact}"
+SHOW_META="$(parse_bool_setting "${SHOW_META_ARG:-0}" "0")"
+
+if [[ "$SHOW_HISTORY" -eq 1 ]]; then
+  [[ ${#POSITIONAL[@]} -gt 0 ]] && die "--history does not accept a natural language request."
+  [[ "$DOCTOR_MODE" -eq 1 ]] && die "--history cannot be used with doctor."
+  if [[ -n "$HISTORY_DAYS_ARG" ]]; then
+    is_positive_int "$HISTORY_DAYS_ARG" || die "--days must be a positive integer."
+  fi
+  show_history "$HISTORY_DAYS_ARG" "$SHOW_FULL" "$JSON_MODE" "$HISTORY_SEARCH_ARG"
+  exit 0
+fi
+
+if [[ -n "$HISTORY_DAYS_ARG" ]]; then
+  die "--days can only be used together with --history."
+fi
+
+if [[ "$SHOW_FULL" -eq 1 ]]; then
+  die "--full can only be used together with --history."
+fi
+
+if [[ -n "$HISTORY_SEARCH_ARG" ]]; then
+  die "--search can only be used together with --history."
+fi
+
+SPINNER_ENABLED=1
+if [[ "$RAW_OUTPUT" -eq 1 || "$JSON_MODE" -eq 1 || "$QUIET_MODE" -eq 1 ]]; then
+  SPINNER_ENABLED=0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "help" ]]; then
+  local_topic=""
+  if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
+    local_topic="${POSITIONAL[1]}"
+  fi
+  [[ ${#POSITIONAL[@]} -gt 2 ]] && die "help accepts at most one topic."
+  show_help_topic "$local_topic"
+  exit 0
+fi
+
+if [[ "$PROFILE_EDITOR_MODE" -eq 1 || ( ${#POSITIONAL[@]} -eq 1 && "${POSITIONAL[0]}" == "profile" ) ]]; then
+  [[ ${#POSITIONAL[@]} -gt 1 ]] && die "profile does not accept additional positional arguments."
+  [[ "$RUN_COMMAND" -eq 1 ]] && die "profile cannot be used with --run."
+  [[ "$RAW_OUTPUT" -eq 1 ]] && die "profile cannot be used with --raw."
+  [[ "$JSON_MODE" -eq 1 ]] && die "profile cannot be used with --json."
+  [[ "$SHOW_HISTORY" -eq 1 ]] && die "profile cannot be used with --history."
+  run_profile_editor "$CONFIG_PATH"
+  exit 0
+fi
+
+if [[ "$SHOW_VERSION" -eq 1 ]]; then
+  echo "ai v$VERSION"
+  exit 0
+fi
+
+if [[ "$DOCTOR_MODE" -eq 1 || ( ${#POSITIONAL[@]} -eq 1 && "${POSITIONAL[0]}" == "doctor" ) ]]; then
+  [[ ${#POSITIONAL[@]} -gt 1 ]] && die "doctor does not accept additional positional arguments."
+  run_doctor "$CONFIG_PATH" "$PROFILE_NAME"
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "providers" ]]; then
+  [[ ${#POSITIONAL[@]} -ne 2 ]] && die "Usage: ai providers <list|check>"
+  run_providers "${POSITIONAL[1]}"
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "config" ]]; then
+  [[ ${#POSITIONAL[@]} -lt 3 ]] && die "Usage: ai config <get|set> <path> [value]"
+  action="${POSITIONAL[1]}"
+  case "$action" in
+    get)
+      [[ ${#POSITIONAL[@]} -ne 3 ]] && die "Usage: ai config get <path>"
+      config_get_path "$CONFIG_PATH" "${POSITIONAL[2]}"
+      ;;
+    set)
+      [[ ${#POSITIONAL[@]} -ne 4 ]] && die "Usage: ai config set <path> <value>"
+      config_set_path "$CONFIG_PATH" "${POSITIONAL[2]}" "${POSITIONAL[3]}"
+      echo "Set ${POSITIONAL[2]} in $CONFIG_PATH"
+      ;;
+    *)
+      die "Usage: ai config <get|set> <path> [value]"
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "replay" ]]; then
+  [[ ${#POSITIONAL[@]} -ne 2 ]] && die "Usage: ai replay <id|latest>"
+  run_replay "${POSITIONAL[1]}"
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "init" ]]; then
+  [[ ${#POSITIONAL[@]} -gt 1 ]] && die "init does not accept additional positional arguments."
+  run_init "$CONFIG_PATH" "$FORCE_MODE"
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "update" ]]; then
+  [[ ${#POSITIONAL[@]} -gt 1 ]] && die "update does not accept additional positional arguments."
+  [[ "$RUN_COMMAND" -eq 1 ]] && die "update cannot be used with --run."
+  [[ "$RAW_OUTPUT" -eq 1 ]] && die "update cannot be used with --raw."
+  [[ "$JSON_MODE" -eq 1 ]] && die "update cannot be used with --json."
+  [[ "$SHOW_HISTORY" -eq 1 ]] && die "update cannot be used with --history."
+  [[ "$EXPLAIN_MODE" -eq 1 ]] && die "update cannot be used with --explain."
+  [[ "$COPY_MODE" -eq 1 ]] && die "update cannot be used with --copy."
+  run_update "$UPDATE_REF_ARG" "$UPDATE_SCOPE_ARG"
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "uninstall" ]]; then
+  [[ ${#POSITIONAL[@]} -gt 1 ]] && die "uninstall does not accept additional positional arguments."
+  run_uninstall
+  exit 0
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 && "${POSITIONAL[0]}" == "completion" ]]; then
+  [[ ${#POSITIONAL[@]} -ne 2 ]] && die "Usage: ai completion <zsh|bash|fish>"
+  run_completion "${POSITIONAL[1]}"
+  exit 0
+fi
+
+if [[ "$FORCE_MODE" -eq 1 ]]; then
+  die "--force can only be used with 'ai init'."
+fi
+
+if [[ -n "$UPDATE_REF_ARG" || -n "$UPDATE_SCOPE_ARG" ]]; then
+  die "--ref/--scope can only be used with 'ai update'."
+fi
+
+load_config_values "$CONFIG_PATH" "$PROFILE_NAME"
+
+PROVIDER="${PROVIDER_ARG:-${PROVIDER_CFG:-codex}}"
+if [[ "$MODEL_ARG_SET" -eq 1 ]]; then
+  MODEL="$MODEL_ARG"
+else
+  MODEL="${MODEL_CFG:-}"
+fi
+PROVIDER_CMD_EFFECTIVE="${PROVIDER_CMD_CFG:-}"
+TARGET_SHELL="${TARGET_SHELL_ARG:-${TARGET_SHELL_CFG:-zsh}}"
+TIMEOUT_SECONDS="${TIMEOUT_ARG:-${TIMEOUT_SECONDS_CFG:-30}}"
+MAX_RETRIES="${MAX_RETRIES_ARG:-${MAX_RETRIES_CFG:-1}}"
+PROMPT_MODE="${PROMPT_MODE_ARG:-${PROMPT_MODE_CFG:-strict}}"
+UI_MODE="${UI_MODE_ARG:-${UI_MODE_CFG:-compact}}"
+SHOW_META_RAW="${SHOW_META_ARG:-${SHOW_META_CFG:-0}}"
+SHOW_META="$(parse_bool_setting "$SHOW_META_RAW" "0")"
+
+case "$TARGET_SHELL" in
+  zsh|bash|fish|powershell) ;;
+  *) die "Unsupported shell: '$TARGET_SHELL'. Use zsh, bash, fish, or powershell." ;;
+esac
+case "$PROMPT_MODE" in
+  strict|creative) ;;
+  *) die "Unsupported prompt mode: '$PROMPT_MODE'. Use strict or creative." ;;
+esac
+case "$UI_MODE" in
+  compact|pretty) ;;
+  *) die "Unsupported ui mode: '$UI_MODE'. Use compact or pretty." ;;
+esac
+
+is_positive_int "$TIMEOUT_SECONDS" || die "--timeout must be a positive integer."
+is_positive_int "$MAX_RETRIES" || die "--max-retries must be a positive integer."
+
+[[ ${#POSITIONAL[@]} -eq 0 ]] && die "You must provide a natural language request. Use -h for help."
+
+INTENT="${POSITIONAL[*]}"
+PROMPT_TEXT="$(build_prompt "$INTENT" "$TARGET_SHELL" "$PROMPT_MODE")"
+TEMPLATE="$(resolve_provider_cmd_template "$PROVIDER" "$MODEL" "$RAW_OUTPUT")"
+
+run_provider_prompt "$PROMPT_TEXT" "command generation"
+OUTPUT="$LAST_PROVIDER_OUTPUT"
+
+if [[ "$RAW_OUTPUT" -eq 1 ]]; then
+  [[ -z "$(trim "$OUTPUT")" ]] && die "The provider returned empty output. Check your authenticated CLI configuration."
+  printf '%s\n' "$OUTPUT"
+  exit 0
+fi
+
+if [[ "$PROVIDER" == "opencode" ]]; then
+  OUTPUT="$(extract_opencode_text "$OUTPUT")"
+fi
+
+[[ -z "$(trim "$OUTPUT")" ]] && die "The provider returned empty output. Check your authenticated CLI configuration."
+
+SUGGESTED_COMMAND="$(strip_fences_and_noise "$OUTPUT")"
+[[ -z "$(trim "$SUGGESTED_COMMAND")" ]] && die "Could not extract a runnable command from provider output."
+append_history "$INTENT" "$SUGGESTED_COMMAND"
+
+EXPLANATION=""
+if [[ "$EXPLAIN_MODE" -eq 1 ]]; then
+  EXPLAIN_PROMPT="$(build_explain_prompt "$SUGGESTED_COMMAND" "$TARGET_SHELL")"
+  run_provider_prompt "$EXPLAIN_PROMPT" "explanation generation"
+  EXPLANATION="$(trim "$(strip_fences_and_noise "$LAST_PROVIDER_OUTPUT")")"
+fi
+
+if [[ "$COPY_MODE" -eq 1 ]]; then
+  if ! copy_to_clipboard "$SUGGESTED_COMMAND"; then
+    case "$(detect_os)" in
+      Darwin)
+        die "Clipboard copy failed on macOS. Ensure 'pbcopy' is available."
+        ;;
+      Linux)
+        die "Clipboard copy failed on Linux. Install one of: wl-copy, xclip, or xsel."
+        ;;
+      *)
+        die "Clipboard copy is not supported on this OS."
+        ;;
+    esac
+  fi
+elif [[ "$AUTO_COPY_MODE" -eq 1 && "$RUN_COMMAND" -eq 0 && "$JSON_MODE" -eq 0 ]]; then
+  copy_to_clipboard "$SUGGESTED_COMMAND" >/dev/null 2>&1 || true
+fi
+
+if [[ "$RUN_COMMAND" -eq 1 ]]; then
+  if is_dangerous_command "$SUGGESTED_COMMAND"; then
+    CONFIRM_RUN=1
+    warn "this command matches dangerous patterns and requires confirmation."
+  fi
+
+  if [[ "$CONFIRM_RUN" -eq 1 ]]; then
+    if ! prompt_confirm "Run command? [y/N] "; then
+      die "Command execution requires confirmation."
+    fi
+  fi
+
+  run_command_with_ui "$SUGGESTED_COMMAND"
+  exit $?
+fi
+
+if [[ "$JSON_MODE" -eq 1 ]]; then
+  NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  printf '{"timestamp":"%s","provider":"%s","model":"%s","shell":"%s","prompt_mode":"%s","command":"%s","explanation":"%s","copied":%s}\n' \
+    "$(json_escape "$NOW_ISO")" \
+    "$(json_escape "$PROVIDER")" \
+    "$(json_escape "$MODEL")" \
+    "$(json_escape "$TARGET_SHELL")" \
+    "$(json_escape "$PROMPT_MODE")" \
+    "$(json_escape "$SUGGESTED_COMMAND")" \
+    "$(json_escape "$EXPLANATION")" \
+    "$([[ "$COPY_MODE" -eq 1 ]] && echo true || echo false)"
+  exit 0
+fi
+
+print_generated_output "$SUGGESTED_COMMAND" "$EXPLANATION"
