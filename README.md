@@ -248,6 +248,8 @@ ai --raw "show listening ports"
 
 Note: `--raw` prints provider-native JSON/JSONL output. Some providers emit multiple JSON lines (event streams).
 
+`ai update` checks versions first and skips reinstall when you are already up to date (or already at the requested tag).
+
 ## Notes
 
 - Requires at least one published GitHub Release for remote `install.sh` usage (it resolves `latest` release by default).

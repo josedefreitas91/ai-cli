@@ -57,25 +57,51 @@ FAKE_CURL="$TMP_DIR/curl"
 cat > "$FAKE_CURL" <<'CURL'
 #!/usr/bin/env bash
 set -euo pipefail
+url=""
+for arg in "$@"; do
+  case "$arg" in
+    http://*|https://*) url="$arg" ;;
+  esac
+done
+
+if [[ "$url" == *"/releases/latest" ]]; then
+  printf '%s\n' '{"tag_name":"v0.0.1"}'
+  exit 0
+fi
+
+if [[ "$url" == *"/install.sh" ]]; then
 cat <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" > "${UPDATE_CAPTURE:?UPDATE_CAPTURE missing}"
+touch "${UPDATE_INSTALL_CALLED:?UPDATE_INSTALL_CALLED missing}"
 SCRIPT
+  exit 0
+fi
+
+echo "unexpected curl args: $*" >&2
+exit 2
 CURL
 chmod +x "$FAKE_CURL"
 
 UPDATE_CAPTURE="$TMP_DIR/update-capture.txt"
-HOME="$TMP_DIR" PATH="$TMP_DIR:$PATH" UPDATE_CAPTURE="$UPDATE_CAPTURE" $AI_BIN update >/dev/null
-grep -q '^--repo$' "$UPDATE_CAPTURE" || fail "Expected ai update to pass --repo flag."
-grep -q '^josedefreitas91/ai-cli$' "$UPDATE_CAPTURE" || fail "Expected ai update default repo value."
+UPDATE_INSTALL_CALLED="$TMP_DIR/update-install-called"
+HOME="$TMP_DIR" PATH="$TMP_DIR:$PATH" UPDATE_CAPTURE="$UPDATE_CAPTURE" UPDATE_INSTALL_CALLED="$UPDATE_INSTALL_CALLED" UPDATE_UPTODATE_OUTPUT="$($AI_BIN update)"
+[[ "$UPDATE_UPTODATE_OUTPUT" == *"already up to date"* ]] || fail "Expected ai update to report up-to-date."
+[[ ! -e "$UPDATE_INSTALL_CALLED" ]] || fail "Expected ai update to skip reinstall when already up to date."
 
-HOME="$TMP_DIR" PATH="$TMP_DIR:$PATH" UPDATE_CAPTURE="$UPDATE_CAPTURE" \
-  $AI_BIN update --ref tags/v0.0.1 --scope global >/dev/null
+rm -f "$UPDATE_INSTALL_CALLED"
+HOME="$TMP_DIR" PATH="$TMP_DIR:$PATH" UPDATE_CAPTURE="$UPDATE_CAPTURE" UPDATE_INSTALL_CALLED="$UPDATE_INSTALL_CALLED" UPDATE_SAME_REF_OUTPUT="$($AI_BIN update --ref tags/v0.0.1 --scope global)"
+[[ "$UPDATE_SAME_REF_OUTPUT" == *"already at requested version"* ]] || fail "Expected ai update to skip same requested version."
+[[ ! -e "$UPDATE_INSTALL_CALLED" ]] || fail "Expected ai update --ref current version to skip reinstall."
+
+HOME="$TMP_DIR" PATH="$TMP_DIR:$PATH" UPDATE_CAPTURE="$UPDATE_CAPTURE" UPDATE_INSTALL_CALLED="$UPDATE_INSTALL_CALLED" \
+  $AI_BIN update --ref tags/v0.0.2 --scope global >/dev/null
 grep -q '^--ref$' "$UPDATE_CAPTURE" || fail "Expected ai update to pass --ref flag."
-grep -q '^tags/v0.0.1$' "$UPDATE_CAPTURE" || fail "Expected ai update ref value."
+grep -q '^tags/v0.0.2$' "$UPDATE_CAPTURE" || fail "Expected ai update to pass new ref value."
 grep -q '^--scope$' "$UPDATE_CAPTURE" || fail "Expected ai update to pass --scope flag."
 grep -q '^global$' "$UPDATE_CAPTURE" || fail "Expected ai update scope value."
+[[ -e "$UPDATE_INSTALL_CALLED" ]] || fail "Expected ai update to call installer for newer requested tag."
 
 if HOME="$TMP_DIR" PATH="$TMP_DIR:$PATH" $AI_BIN --ref tags/v0.0.1 "anything" >/dev/null 2>"$TMP_DIR/update_ref.err"; then
   fail "Expected --ref without update to fail."

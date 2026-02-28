@@ -388,7 +388,9 @@ FISH
 run_update() {
   local ref="${1:-}"
   local scope="${2:-}"
-  local repo owner_name repo_name install_url
+  local repo owner_name repo_name install_url latest_api_url latest_tag target_tag
+  local local_version normalized_target_version normalized_local_version
+  local should_check_latest=0
   local install_args=()
 
   owner_name="${AI_CLI_GITHUB_OWNER:-josedefreitas91}"
@@ -403,6 +405,33 @@ run_update() {
     esac
   fi
 
+  if [[ -z "$ref" || "$ref" == "latest" ]]; then
+    should_check_latest=1
+  fi
+
+  if [[ "$should_check_latest" -eq 1 ]]; then
+    latest_api_url="https://api.github.com/repos/${repo}/releases/latest"
+    latest_tag="$(curl -fsSL "$latest_api_url" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    [[ -z "$latest_tag" ]] && die "Could not resolve latest release tag for ${repo}."
+
+    normalized_local_version="${VERSION#v}"
+    normalized_target_version="${latest_tag#v}"
+    if [[ "$normalized_local_version" == "$normalized_target_version" ]]; then
+      echo "ai-cli is already up to date (v$normalized_local_version)."
+      return 0
+    fi
+
+    ref="tags/$latest_tag"
+  elif [[ "$ref" == tags/* ]]; then
+    target_tag="${ref#tags/}"
+    normalized_local_version="${VERSION#v}"
+    normalized_target_version="${target_tag#v}"
+    if [[ "$normalized_local_version" == "$normalized_target_version" ]]; then
+      echo "ai-cli is already at requested version (v$normalized_local_version)."
+      return 0
+    fi
+  fi
+
   install_args+=(--repo "$repo")
   if [[ -n "$ref" ]]; then
     install_args+=(--ref "$ref")
@@ -412,7 +441,8 @@ run_update() {
   fi
 
   has_cmd curl || die "Could not find 'curl' required for update."
-  echo "Updating ai-cli from ${repo}..."
+  local_version="${VERSION#v}"
+  echo "Updating ai-cli from ${repo} (current: v${local_version})..."
   curl -fsSL "$install_url" | bash -s -- "${install_args[@]}"
 }
 
