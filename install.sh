@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 BIN_SRC="$SCRIPT_DIR/bin/ai"
 LIB_DIR_SRC="$SCRIPT_DIR/lib"
 CONFIG_DIR_SRC="$SCRIPT_DIR/config"
@@ -142,7 +143,11 @@ done
 
 # If local sources are not present, bootstrap from GitHub and re-exec.
 if [[ ! -x "$BIN_SRC" || ! -d "$LIB_DIR_SRC" || ! -f "$TOML_EXAMPLE" ]]; then
-  bootstrap_and_reexec "$REPO" "$REF" "${INSTALL_ARGS[@]}"
+  if [[ "${#INSTALL_ARGS[@]}" -gt 0 ]]; then
+    bootstrap_and_reexec "$REPO" "$REF" "${INSTALL_ARGS[@]}"
+  else
+    bootstrap_and_reexec "$REPO" "$REF"
+  fi
 fi
 
 # From this point, install local source.
