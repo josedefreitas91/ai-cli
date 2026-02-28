@@ -47,6 +47,10 @@ prompt_default() {
   local question="$1"
   local default="$2"
   local answer
+  if [[ ! -t 0 ]]; then
+    printf '%s' "$default"
+    return 0
+  fi
   read -r -p "$question [$default]: " answer
   printf '%s' "${answer:-$default}"
 }
@@ -55,6 +59,12 @@ prompt_yes_no() {
   local question="$1"
   local default="${2:-Y}"
   local answer
+  if [[ ! -t 0 ]]; then
+    case "$default" in
+      y|Y|yes|YES) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
   read -r -p "$question [$default]: " answer
   answer="${answer:-$default}"
   case "$answer" in
@@ -249,7 +259,11 @@ if [[ "$REUSE_EXISTING_CONFIG" -eq 0 ]]; then
   PROMPT_MODE="$(prompt_default "Default prompt mode (strict/creative)" "strict")"
   UI_MODE="$(prompt_default "Default UI mode (compact/pretty)" "compact")"
   SHOW_META="$(prompt_default "Show metadata by default? (0/1)" "0")"
-  read -r -p "Custom provider_cmd (optional): " PROVIDER_CMD
+  if [[ -t 0 ]]; then
+    read -r -p "Custom provider_cmd (optional): " PROVIDER_CMD
+  else
+    PROVIDER_CMD=""
+  fi
   echo
 
   case "$PROMPT_MODE" in
